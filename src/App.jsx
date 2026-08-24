@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import {
   Plus, X, CalendarDays, TrendingUp, AlertTriangle, ChevronRight, Trash2, BookOpen,
-  Download, Share2,
+  Download, Share2, Pencil,
 } from "lucide-react";
 
 /* ============================================================
@@ -13,6 +13,7 @@ import {
    ============================================================ */
 
 const STORAGE_KEY = "leave-ledger-data";
+const HOURS_PER_DAY = 8; // 1일 = 8시간 기준 환산
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -46,8 +47,12 @@ function calcAccrued(hireDateStr, asOf) {
   return { accrued, basis: `근속 ${years}년차 · 기본 15일 + 가산 ${extra}일` };
 }
 
-function usedDays(logs) {
-  return logs.reduce((sum, l) => sum + (Number(l.days) || 0), 0);
+// 사용 시간 합계(시간 단위). 예전 버전에서 만든 '일' 단위 기록(days)도 8시간=1일로 환산해 인식
+function usedHours(logs) {
+  return logs.reduce((sum, l) => {
+    if (l.hours !== undefined) return sum + (Number(l.hours) || 0);
+    return sum + (Number(l.days) || 0) * 8;
+  }, 0);
 }
 
 const seedWorkers = () => {
@@ -74,18 +79,18 @@ const seedLogs = (workers) => {
   workers.forEach((w, i) => {
     logs[w.id] = [];
   });
-  // 몇 명에게만 샘플 사용 기록 부여
+  // 몇 명에게만 샘플 사용 기록 부여 (1시간 단위, 8시간 = 1일)
   if (workers[0]) logs[workers[0].id] = [
-    { id: uid(), date: `${new Date().getFullYear()}-03-04`, days: 1, note: "개인 사유" },
-    { id: uid(), date: `${new Date().getFullYear()}-05-02`, days: 1, note: "병원 진료" },
+    { id: uid(), date: `${new Date().getFullYear()}-03-04`, hours: 8, note: "개인 사유" },
+    { id: uid(), date: `${new Date().getFullYear()}-05-02`, hours: 4, note: "병원 진료" },
   ];
   if (workers[1]) logs[workers[1].id] = [
-    { id: uid(), date: `${new Date().getFullYear()}-02-14`, days: 2, note: "가족 행사" },
+    { id: uid(), date: `${new Date().getFullYear()}-02-14`, hours: 16, note: "가족 행사" },
   ];
   if (workers[3]) logs[workers[3].id] = [
-    { id: uid(), date: `${new Date().getFullYear()}-01-10`, days: 1, note: "" },
-    { id: uid(), date: `${new Date().getFullYear()}-04-22`, days: 1, note: "" },
-    { id: uid(), date: `${new Date().getFullYear()}-06-18`, days: 1, note: "" },
+    { id: uid(), date: `${new Date().getFullYear()}-01-10`, hours: 8, note: "" },
+    { id: uid(), date: `${new Date().getFullYear()}-04-22`, hours: 3, note: "" },
+    { id: uid(), date: `${new Date().getFullYear()}-06-18`, hours: 8, note: "" },
   ];
   return logs;
 };
@@ -95,14 +100,22 @@ export default function LeaveLedger() {
   const [logs, setLogs] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState(null);
+  const [editingWorker, setEditingWorker] = useState(false);
+  const [confirmDeleteWorker, setConfirmDeleteWorker] = useState(false);
   const [showAddWorker, setShowAddWorker] = useState(false);
   const [showAddLog, setShowAddLog] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [selectedDept, setSelectedDept] = useState("전체");
+  const [selectedStatus, setSelectedStatus] = useState("전체");
   const [sharedMode, setSharedMode] = useState(false);
   const [showShareConfirm, setShowShareConfirm] = useState(false);
 
   const today = useMemo(() => new Date(), []);
+
+  useEffect(() => {
+    setEditingWorker(false);
+    setConfirmDeleteWorker(false);
+  }, [selectedId]);
 
   // 초기 로드
   useEffect(() => {
@@ -154,12 +167,15 @@ export default function LeaveLedger() {
     if (!workers) return [];
     return workers.map((w) => {
       const { accrued, basis } = calcAccrued(w.hireDate, today);
-      const used = usedDays(logs?.[w.id] || []);
+      const usedH = usedHours(logs?.[w.id] || []);
+      const used = usedH / HOURS_PER_DAY;
       const remaining = Math.max(accrued - used, 0);
       const usageRate = accrued > 0 ? used / accrued : 0;
       const monthsLeftInYear = 12 - (today.getMonth() + 1);
       const atRisk = accrued > 0 && usageRate < 0.3 && monthsLeftInYear <= 3;
-      return { ...w, accrued, basis, used, remaining, usageRate, atRisk };
+      const { years: tenureYears } = tenure(new Date(w.hireDate + "T00:00:00"), today);
+      const status = tenureYears < 1 ? "1년 미만 근로인" : "근로인";
+      return { ...w, accrued, basis, used, usedHours: usedH, remaining, usageRate, atRisk, status };
     });
   }, [workers, logs, today]);
 
@@ -168,9 +184,16 @@ export default function LeaveLedger() {
     return ["전체", ...Array.from(set)];
   }, [rows]);
 
+  const statuses = ["전체", "근로인", "1년 미만 근로인"];
+
   const filteredRows = useMemo(
-    () => (selectedDept === "전체" ? rows : rows.filter((r) => r.dept === selectedDept)),
-    [rows, selectedDept]
+    () =>
+      rows.filter(
+        (r) =>
+          (selectedDept === "전체" || r.dept === selectedDept) &&
+          (selectedStatus === "전체" || r.status === selectedStatus)
+      ),
+    [rows, selectedDept, selectedStatus]
   );
 
   const totals = useMemo(() => {
@@ -187,7 +210,7 @@ export default function LeaveLedger() {
     () =>
       [...filteredRows]
         .sort((a, b) => b.remaining - a.remaining)
-        .map((r) => ({ name: r.name, 잔여: r.remaining, atRisk: r.atRisk })),
+        .map((r) => ({ name: r.name, 잔여: Math.round(r.remaining * 10) / 10, atRisk: r.atRisk })),
     [filteredRows]
   );
 
@@ -202,12 +225,18 @@ export default function LeaveLedger() {
     setShowAddWorker(false);
   };
 
+  const updateWorker = (id, data) => {
+    setWorkers((workers || []).map((w) => (w.id === id ? { ...w, ...data } : w)));
+    setEditingWorker(false);
+  };
+
   const removeWorker = (id) => {
     setWorkers((workers || []).filter((w) => w.id !== id));
     const nextLogs = { ...(logs || {}) };
     delete nextLogs[id];
     setLogs(nextLogs);
     setSelectedId(null);
+    setConfirmDeleteWorker(false);
   };
 
   const addLog = (workerId, entry) => {
@@ -261,15 +290,17 @@ export default function LeaveLedger() {
     const data = filteredRows.map((r) => ({
       이름: r.name,
       소속: r.dept,
+      구분: r.status,
       입사일: r.hireDate,
       부여일수: r.accrued,
-      사용일수: r.used,
-      잔여일수: r.remaining,
+      사용시간: r.usedHours,
+      사용일수: Number(r.used.toFixed(2)),
+      잔여일수: Number(r.remaining.toFixed(2)),
       소진율: `${Math.round(r.usageRate * 100)}%`,
       비고: r.basis,
     }));
     const ws = XLSX.utils.json_to_sheet(data);
-    ws["!cols"] = [{ wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 30 }];
+    ws["!cols"] = [{ wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 30 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "연차현황");
     const filename = `연차현황_${selectedDept}_${toISO(today)}.xlsx`;
@@ -307,7 +338,7 @@ export default function LeaveLedger() {
       <section style={styles.statGrid}>
         <StatCard label="전체 인원" value={`${rows.length}명`} />
         <StatCard label="총 부여 연차" value={`${totals.totalAccrued}일`} />
-        <StatCard label="총 사용 연차" value={`${totals.totalUsed}일`} />
+        <StatCard label="총 사용 연차" value={`${totals.totalUsed.toFixed(1)}일`} />
         <StatCard
           label="평균 소진율"
           value={`${Math.round(totals.avgRate * 100)}%`}
@@ -331,7 +362,7 @@ export default function LeaveLedger() {
         </div>
       )}
 
-      {/* Controls: 부서 필터 · 엑셀 내보내기 · 공유 모드 */}
+      {/* Controls: 부서 필터 · 근속 구분 · 엑셀 내보내기 · 공유 모드 */}
       <section style={styles.controlsRow}>
         <div style={styles.chipRow}>
           {depts.map((d) => (
@@ -354,6 +385,23 @@ export default function LeaveLedger() {
           >
             <Share2 size={13} strokeWidth={2.5} /> {sharedMode ? "공유중" : "공유"}
           </button>
+        </div>
+      </section>
+
+      <section style={{ ...styles.controlsRow, margin: "8px 16px 0" }}>
+        <div style={styles.chipRow}>
+          {statuses.map((s) => (
+            <button
+              key={s}
+              style={{
+                ...styles.chip,
+                ...(selectedStatus === s ? styles.chipActiveAlt : {}),
+              }}
+              onClick={() => setSelectedStatus(s)}
+            >
+              {s}
+            </button>
+          ))}
         </div>
       </section>
 
@@ -402,13 +450,16 @@ export default function LeaveLedger() {
                 <div style={styles.rowNameLine}>
                   <span style={styles.rowName}>{r.name}</span>
                   <span style={styles.rowDept}>{r.dept}</span>
+                  <span style={r.status === "1년 미만 근로인" ? styles.newTag : styles.regularTag}>
+                    {r.status === "1년 미만 근로인" ? "1년 미만" : "근로인"}
+                  </span>
                   {r.atRisk && <span style={styles.riskTag}>소멸 임박</span>}
                 </div>
                 <PassbookBar used={r.used} accrued={r.accrued} />
               </div>
               <div style={styles.rowNums}>
-                <div style={styles.rowRemaining}>{r.remaining}<span style={styles.rowUnit}>일 잔여</span></div>
-                <div style={styles.rowSub}>{r.used}일 사용 / {r.accrued}일 부여</div>
+                <div style={styles.rowRemaining}>{r.remaining.toFixed(1)}<span style={styles.rowUnit}>일 잔여</span></div>
+                <div style={styles.rowSub}>{r.usedHours}시간 사용 · {r.accrued}일 부여</div>
               </div>
               <ChevronRight size={16} color="#8A968F" style={{ flexShrink: 0 }} />
             </div>
@@ -429,57 +480,75 @@ export default function LeaveLedger() {
       {/* Detail modal */}
       {selected && (
         <Modal onClose={() => setSelectedId(null)}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-            <div>
-              <div style={styles.modalTitle}>{selected.name}</div>
-              <div style={styles.modalSub}>{selected.dept} · 입사 {selected.hireDate}</div>
-            </div>
-            <button
-              style={styles.iconBtnGhost}
-              onClick={() => removeWorker(selected.id)}
-              aria-label="인원 삭제"
-              title="인원 삭제"
-            >
-              <Trash2 size={16} />
-            </button>
-          </div>
+          <div style={styles.modalTitle}>{selected.name}</div>
+          <div style={styles.modalSub}>{selected.dept} · 입사 {selected.hireDate} · {selected.status}</div>
 
-          <div style={styles.detailStatRow}>
-            <DetailStat label="부여" value={`${selected.accrued}일`} />
-            <DetailStat label="사용" value={`${selected.used}일`} />
-            <DetailStat label="잔여" value={`${selected.remaining}일`} strong />
-          </div>
-          <div style={styles.basisLine}>{selected.basis}</div>
-
-          <PassbookBar used={selected.used} accrued={selected.accrued} big />
-
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18, marginBottom: 6 }}>
-            <div style={styles.cardTitleSmall}>사용 내역</div>
-            <button style={styles.addBtnSmall} onClick={() => setShowAddLog(true)}>
-              <Plus size={13} strokeWidth={2.5} /> 사용 등록
-            </button>
-          </div>
-
-          <div>
-            {(logs[selected.id] || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((l) => (
-              <div key={l.id} style={styles.logRow}>
-                <CalendarDays size={14} color="#5B6663" style={{ flexShrink: 0 }} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={styles.logDate}>{l.date}</div>
-                  {l.note && <div style={styles.logNote}>{l.note}</div>}
-                </div>
-                <div style={styles.logDays}>{l.days}일</div>
-                <button style={styles.iconBtnGhost} onClick={() => removeLog(selected.id, l.id)} aria-label="삭제">
-                  <X size={14} />
+          {editingWorker ? (
+            <AddWorkerForm
+              initial={selected}
+              submitLabel="저장"
+              onSubmit={(data) => updateWorker(selected.id, data)}
+              onCancel={() => setEditingWorker(false)}
+            />
+          ) : (
+            <>
+              <div style={styles.actionRow}>
+                <button style={styles.smallActionBtn} onClick={() => setEditingWorker(true)}>
+                  <Pencil size={13} strokeWidth={2.25} /> 정보 수정
+                </button>
+                <button style={styles.smallActionBtnDanger} onClick={() => setConfirmDeleteWorker(true)}>
+                  <Trash2 size={13} strokeWidth={2.25} /> 인원 삭제
                 </button>
               </div>
-            ))}
-            {(logs[selected.id] || []).length === 0 && (
-              <div style={{ color: "var(--ink-soft)", fontSize: 13, padding: "10px 0" }}>
-                아직 사용 기록이 없어요.
+
+              {confirmDeleteWorker && (
+                <div style={styles.confirmBar}>
+                  <span>정말 삭제할까요? 사용 기록도 함께 사라져요.</span>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button style={styles.btnGhostSmall} onClick={() => setConfirmDeleteWorker(false)}>취소</button>
+                    <button style={styles.btnDangerSmall} onClick={() => removeWorker(selected.id)}>삭제</button>
+                  </div>
+                </div>
+              )}
+
+              <div style={styles.detailStatRow}>
+                <DetailStat label="부여" value={`${selected.accrued}일`} />
+                <DetailStat label="사용" value={`${selected.usedHours}시간`} />
+                <DetailStat label="잔여" value={`${selected.remaining.toFixed(2)}일`} strong />
               </div>
-            )}
-          </div>
+              <div style={styles.basisLine}>{selected.basis} · 8시간 = 1일로 환산</div>
+
+              <PassbookBar used={selected.used} accrued={selected.accrued} big />
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18, marginBottom: 6 }}>
+                <div style={styles.cardTitleSmall}>사용 내역</div>
+                <button style={styles.addBtnSmall} onClick={() => setShowAddLog(true)}>
+                  <Plus size={13} strokeWidth={2.5} /> 사용 등록
+                </button>
+              </div>
+
+              <div>
+                {(logs[selected.id] || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((l) => (
+                  <div key={l.id} style={styles.logRow}>
+                    <CalendarDays size={14} color="#5B6663" style={{ flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={styles.logDate}>{l.date}</div>
+                      {l.note && <div style={styles.logNote}>{l.note}</div>}
+                    </div>
+                    <div style={styles.logDays}>{l.hours ?? (l.days || 0) * 8}시간</div>
+                    <button style={styles.iconBtnGhost} onClick={() => removeLog(selected.id, l.id)} aria-label="삭제">
+                      <X size={14} />
+                    </button>
+                  </div>
+                ))}
+                {(logs[selected.id] || []).length === 0 && (
+                  <div style={{ color: "var(--ink-soft)", fontSize: 13, padding: "10px 0" }}>
+                    아직 사용 기록이 없어요.
+                  </div>
+                )}
+              </div>
+            </>
+          )}
         </Modal>
       )}
 
@@ -589,10 +658,10 @@ function Modal({ children, onClose }) {
   );
 }
 
-function AddWorkerForm({ onSubmit, onCancel }) {
-  const [name, setName] = useState("");
-  const [dept, setDept] = useState("");
-  const [hireDate, setHireDate] = useState(toISO(new Date()));
+function AddWorkerForm({ onSubmit, onCancel, initial, submitLabel }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [dept, setDept] = useState(initial?.dept || "");
+  const [hireDate, setHireDate] = useState(initial?.hireDate || toISO(new Date()));
 
   const submit = () => {
     if (!name.trim()) return;
@@ -604,7 +673,7 @@ function AddWorkerForm({ onSubmit, onCancel }) {
       <Field label="이름">
         <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 김O훈" />
       </Field>
-      <Field label="소속">
+      <Field label="소속 (자유롭게 입력 — 팀명, 근로 형태 등 무엇이든 가능)">
         <input style={styles.input} value={dept} onChange={(e) => setDept(e.target.value)} placeholder="예: 조립1팀" />
       </Field>
       <Field label="입사일">
@@ -612,7 +681,7 @@ function AddWorkerForm({ onSubmit, onCancel }) {
       </Field>
       <div style={styles.formActions}>
         <button style={styles.btnGhost} onClick={onCancel}>취소</button>
-        <button style={styles.btnPrimary} onClick={submit}>추가</button>
+        <button style={styles.btnPrimary} onClick={submit}>{submitLabel || "추가"}</button>
       </div>
     </div>
   );
@@ -620,12 +689,12 @@ function AddWorkerForm({ onSubmit, onCancel }) {
 
 function AddLogForm({ onSubmit, onCancel }) {
   const [date, setDate] = useState(toISO(new Date()));
-  const [days, setDays] = useState(1);
+  const [hours, setHours] = useState(8);
   const [note, setNote] = useState("");
 
   const submit = () => {
-    if (!date || !days) return;
-    onSubmit({ date, days: Number(days), note: note.trim() });
+    if (!date || !hours) return;
+    onSubmit({ date, hours: Math.round(Number(hours)), note: note.trim() });
   };
 
   return (
@@ -633,14 +702,14 @@ function AddLogForm({ onSubmit, onCancel }) {
       <Field label="사용일">
         <input type="date" style={styles.input} value={date} onChange={(e) => setDate(e.target.value)} />
       </Field>
-      <Field label="일수">
+      <Field label="사용 시간 (1시간 단위, 8시간 = 1일)">
         <input
           type="number"
-          min="0.5"
-          step="0.5"
+          min="1"
+          step="1"
           style={styles.input}
-          value={days}
-          onChange={(e) => setDays(e.target.value)}
+          value={hours}
+          onChange={(e) => setHours(e.target.value)}
         />
       </Field>
       <Field label="메모 (선택)">
@@ -747,6 +816,7 @@ const styles = {
     cursor: "pointer", fontFamily: "var(--font-body)",
   },
   chipActive: { background: "var(--forest)", color: "#EAEFEC", borderColor: "var(--forest)" },
+  chipActiveAlt: { background: "var(--jade)", color: "#fff", borderColor: "var(--jade)" },
   iconTextBtn: {
     display: "flex", alignItems: "center", gap: 4,
     fontSize: 11.5, padding: "5px 10px", borderRadius: 14,
@@ -787,6 +857,14 @@ const styles = {
     fontSize: 10, background: "#F5EED9", color: "#8A6414",
     padding: "1px 6px", borderRadius: 10, fontWeight: 600,
   },
+  newTag: {
+    fontSize: 10, background: "#E3ECF7", color: "#2C5C86",
+    padding: "1px 6px", borderRadius: 10, fontWeight: 600,
+  },
+  regularTag: {
+    fontSize: 10, background: "#E1E7E3", color: "#4A5852",
+    padding: "1px 6px", borderRadius: 10, fontWeight: 600,
+  },
   rowNums: { textAlign: "right", flexShrink: 0 },
   rowRemaining: { fontFamily: "var(--font-mono)", fontSize: 16, fontWeight: 700, color: "var(--jade)" },
   rowUnit: { fontFamily: "var(--font-body)", fontSize: 10.5, fontWeight: 400, color: "var(--ink-soft)", marginLeft: 2 },
@@ -809,6 +887,33 @@ const styles = {
   },
   modalTitle: { fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 17, paddingRight: 24 },
   modalSub: { fontSize: 12, color: "var(--ink-soft)", marginTop: 3 },
+  actionRow: { display: "flex", gap: 8, marginTop: 14 },
+  smallActionBtn: {
+    display: "flex", alignItems: "center", gap: 4, flex: 1, justifyContent: "center",
+    fontSize: 12.5, padding: "8px 0", borderRadius: 8,
+    border: "1px solid var(--line)", background: "#fff", color: "var(--ink)",
+    cursor: "pointer", fontFamily: "var(--font-body)", fontWeight: 500,
+  },
+  smallActionBtnDanger: {
+    display: "flex", alignItems: "center", gap: 4, flex: 1, justifyContent: "center",
+    fontSize: 12.5, padding: "8px 0", borderRadius: 8,
+    border: "1px solid #E3C7C0", background: "#fff", color: "var(--rust)",
+    cursor: "pointer", fontFamily: "var(--font-body)", fontWeight: 500,
+  },
+  confirmBar: {
+    marginTop: 10, padding: "10px 12px", borderRadius: 8,
+    background: "#F3E4E1", color: "#7A3529", fontSize: 12.5, lineHeight: 1.5,
+  },
+  btnGhostSmall: {
+    flex: 1, padding: "7px 0", borderRadius: 6, border: "1px solid var(--line)",
+    background: "#fff", color: "var(--ink-soft)", fontFamily: "var(--font-body)",
+    fontSize: 12.5, cursor: "pointer",
+  },
+  btnDangerSmall: {
+    flex: 1, padding: "7px 0", borderRadius: 6, border: "none",
+    background: "var(--rust)", color: "#fff", fontFamily: "var(--font-body)",
+    fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+  },
   detailStatRow: {
     display: "flex", marginTop: 16, paddingTop: 12,
     borderTop: "1px solid var(--line)",
