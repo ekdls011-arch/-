@@ -13,7 +13,7 @@ import {
    ============================================================ */
 
 const STORAGE_KEY = "leave-ledger-data";
-const HOURS_PER_DAY = 8; // 1일 = 8시간 기준 환산
+const HOURS_PER_DAY = 6; // 1일 = 6시간 기준 환산 (이 기관 근로자 기준)
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -47,12 +47,63 @@ function calcAccrued(hireDateStr, asOf) {
   return { accrued, basis: `근속 ${years}년차 · 기본 15일 + 가산 ${extra}일` };
 }
 
-// 사용 시간 합계(시간 단위). 예전 버전에서 만든 '일' 단위 기록(days)도 8시간=1일로 환산해 인식
+// 기록 1건의 사용 시간. 예전 버전에서 만든 '일' 단위 기록(days)도 1일=6시간으로 환산해 인식
+function logHours(l) {
+  if (l.hours !== undefined) return Number(l.hours) || 0;
+  return (Number(l.days) || 0) * HOURS_PER_DAY;
+}
+
+// 사용 시간 합계(시간 단위)
 function usedHours(logs) {
-  return logs.reduce((sum, l) => {
-    if (l.hours !== undefined) return sum + (Number(l.hours) || 0);
-    return sum + (Number(l.days) || 0) * 8;
-  }, 0);
+  return logs.reduce((sum, l) => sum + logHours(l), 0);
+}
+
+// "N일 M시간" 형태로 표시 (6시간 = 1일)
+function fmtDH(hours) {
+  const d = Math.floor(hours / HOURS_PER_DAY);
+  const h = hours % HOURS_PER_DAY;
+  if (d === 0 && h === 0) return "0시간";
+  if (d === 0) return `${h}시간`;
+  if (h === 0) return `${d}일`;
+  return `${d}일 ${h}시간`;
+}
+
+// 연차 초과분(= 결근) 계산.
+//  - 사용 기록을 날짜순으로 쌓아가며, 부여 연차(시간)를 넘어선 구간만 '결근 시간'으로 봄
+//  - 공제는 누적 결근 시간을 6시간(1일) 단위로 끊어서, 월별로 새로 채워진 일수만큼만 공제
+//  - 6시간이 안 되는 나머지는 다음 달로 이월되어 1일이 채워지는 달에 공제
+// month: "YYYY-MM" (공제를 보려는 달)
+function calcAbsence(logs, accruedDays, month) {
+  const limitH = accruedDays * HOURS_PER_DAY;
+  const sorted = logs
+    .map((l, i) => ({ date: l.date || "", h: logHours(l), i }))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.i - b.i));
+
+  let cum = 0;
+  const excessByMonth = {};
+  sorted.forEach((l) => {
+    const before = Math.max(0, cum - limitH);
+    cum += l.h;
+    const after = Math.max(0, cum - limitH);
+    const ex = after - before;
+    if (ex > 0) {
+      const ym = l.date.slice(0, 7);
+      excessByMonth[ym] = (excessByMonth[ym] || 0) + ex;
+    }
+  });
+
+  let cumBefore = 0; // 선택한 달 이전까지의 누적 결근 시간
+  let monthExcess = 0; // 선택한 달에 새로 생긴 결근 시간
+  Object.keys(excessByMonth).forEach((ym) => {
+    if (ym < month) cumBefore += excessByMonth[ym];
+    else if (ym === month) monthExcess = excessByMonth[ym];
+  });
+  const cumThrough = cumBefore + monthExcess;
+  const deductDays = Math.floor(cumThrough / HOURS_PER_DAY) - Math.floor(cumBefore / HOURS_PER_DAY);
+  const carryIn = cumBefore % HOURS_PER_DAY; // 지난달에서 넘어온 시간
+  const carryOut = cumThrough % HOURS_PER_DAY; // 다음 달로 넘어갈 시간
+  const totalExcess = Math.max(0, cum - limitH); // 전체 기간 누적 결근 시간
+  return { monthExcess, cumBefore, cumThrough, deductDays, carryIn, carryOut, totalExcess };
 }
 
 const seedWorkers = () => {
@@ -79,18 +130,18 @@ const seedLogs = (workers) => {
   workers.forEach((w, i) => {
     logs[w.id] = [];
   });
-  // 몇 명에게만 샘플 사용 기록 부여 (1시간 단위, 8시간 = 1일)
+  // 몇 명에게만 샘플 사용 기록 부여 (1시간 단위, 6시간 = 1일)
   if (workers[0]) logs[workers[0].id] = [
-    { id: uid(), date: `${new Date().getFullYear()}-03-04`, hours: 8, note: "개인 사유" },
+    { id: uid(), date: `${new Date().getFullYear()}-03-04`, hours: 6, note: "개인 사유" },
     { id: uid(), date: `${new Date().getFullYear()}-05-02`, hours: 4, note: "병원 진료" },
   ];
   if (workers[1]) logs[workers[1].id] = [
     { id: uid(), date: `${new Date().getFullYear()}-02-14`, hours: 16, note: "가족 행사" },
   ];
   if (workers[3]) logs[workers[3].id] = [
-    { id: uid(), date: `${new Date().getFullYear()}-01-10`, hours: 8, note: "" },
+    { id: uid(), date: `${new Date().getFullYear()}-01-10`, hours: 6, note: "" },
     { id: uid(), date: `${new Date().getFullYear()}-04-22`, hours: 3, note: "" },
-    { id: uid(), date: `${new Date().getFullYear()}-06-18`, hours: 8, note: "" },
+    { id: uid(), date: `${new Date().getFullYear()}-06-18`, hours: 6, note: "" },
   ];
   return logs;
 };
@@ -107,6 +158,7 @@ export default function LeaveLedger() {
   const [saveError, setSaveError] = useState(false);
   const [selectedDept, setSelectedDept] = useState("전체");
   const [selectedStatus, setSelectedStatus] = useState("전체");
+  const [absMonth, setAbsMonth] = useState(() => toISO(new Date()).slice(0, 7));
   const [sharedMode, setSharedMode] = useState(false);
   const [showShareConfirm, setShowShareConfirm] = useState(false);
 
@@ -214,7 +266,27 @@ export default function LeaveLedger() {
     [filteredRows]
   );
 
+  // 결근 공제 현황 (선택한 달 기준, 현재 필터가 적용된 인원만)
+  const absenceRows = useMemo(
+    () =>
+      filteredRows
+        .map((r) => ({ ...r, abs: calcAbsence(logs?.[r.id] || [], r.accrued, absMonth) }))
+        .filter((r) => r.abs.cumThrough > 0 || r.abs.monthExcess > 0),
+    [filteredRows, logs, absMonth]
+  );
+
+  const absenceTotals = useMemo(
+    () => ({
+      people: absenceRows.filter((r) => r.abs.deductDays > 0).length,
+      days: absenceRows.reduce((s, r) => s + r.abs.deductDays, 0),
+    }),
+    [absenceRows]
+  );
+
   const selected = rows.find((r) => r.id === selectedId) || null;
+  const selectedAbs = selected
+    ? calcAbsence(logs?.[selected.id] || [], selected.accrued, absMonth)
+    : null;
 
   const addWorker = (data) => {
     const w = { id: uid(), ...data };
@@ -305,6 +377,23 @@ export default function LeaveLedger() {
     XLSX.utils.book_append_sheet(wb, ws, "연차현황");
     const filename = `연차현황_${selectedDept}_${toISO(today)}.xlsx`;
     XLSX.writeFile(wb, filename);
+  };
+
+  const exportAbsenceExcel = () => {
+    const data = absenceRows.map((r) => ({
+      이름: r.name,
+      소속: r.dept,
+      "전월 이월(시간)": r.abs.carryIn,
+      "이번 달 결근(시간)": r.abs.monthExcess,
+      "누적 결근(시간)": r.abs.cumThrough,
+      "이번 달 공제(일)": r.abs.deductDays,
+      "다음 달 이월(시간)": r.abs.carryOut,
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws["!cols"] = [{ wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 14 }, { wch: 16 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, `${absMonth} 결근공제`);
+    XLSX.writeFile(wb, `결근공제_${absMonth}.xlsx`);
   };
 
   if (loading) {
@@ -472,6 +561,59 @@ export default function LeaveLedger() {
         </div>
       </section>
 
+      {/* 결근 공제 현황 */}
+      <section style={styles.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+          <div style={styles.cardTitle}>결근 공제 (연차 초과분)</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input
+              type="month"
+              value={absMonth}
+              onChange={(e) => e.target.value && setAbsMonth(e.target.value)}
+              style={{ ...styles.input, width: "auto", padding: "5px 8px", fontSize: 12.5 }}
+            />
+            <button style={styles.iconTextBtn} onClick={exportAbsenceExcel}>
+              <Download size={13} strokeWidth={2.5} /> 엑셀
+            </button>
+          </div>
+        </div>
+
+        <div style={styles.absSummary}>
+          <span>{absMonth.replace("-", "년 ")}월 공제 대상 <strong>{absenceTotals.people}명</strong></span>
+          <span>총 공제 <strong>{absenceTotals.days}일</strong></span>
+        </div>
+
+        <div>
+          {absenceRows.map((r) => (
+            <div key={r.id} style={styles.absRow} onClick={() => setSelectedId(r.id)}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={styles.rowName}>{r.name} <span style={styles.rowDept}>{r.dept}</span></div>
+                <div style={styles.absDetail}>
+                  이번 달 결근 {fmtDH(r.abs.monthExcess)}
+                  {r.abs.carryIn > 0 && ` · 전월 이월 ${r.abs.carryIn}시간`}
+                </div>
+                <div style={styles.absDetail}>
+                  누적 {fmtDH(r.abs.cumThrough)}
+                  {r.abs.carryOut > 0 && ` · 다음 달 이월 ${r.abs.carryOut}시간`}
+                </div>
+              </div>
+              <div style={r.abs.deductDays > 0 ? styles.absDeduct : styles.absDeductZero}>
+                {r.abs.deductDays > 0 ? `${r.abs.deductDays}일 공제` : "공제 없음"}
+              </div>
+            </div>
+          ))}
+          {absenceRows.length === 0 && (
+            <div style={{ padding: "16px 4px", color: "var(--ink-soft)", fontSize: 13, lineHeight: 1.6 }}>
+              이 달까지 연차를 초과한 인원이 없어요.
+            </div>
+          )}
+        </div>
+        <div style={{ ...styles.footNote, padding: "10px 2px 4px" }}>
+          부여 연차를 모두 쓴 뒤의 사용 시간을 결근으로 보고, 누적 {HOURS_PER_DAY}시간(1일)이 채워질 때마다 1일씩 공제합니다.
+          {HOURS_PER_DAY}시간이 안 되는 시간은 다음 달로 이월돼요.
+        </div>
+      </section>
+
       <div style={styles.footNote}>
         * 연차 부여 일수는 근로기준법 제60조를 기준으로 한 간이 계산치입니다. 전년도 출근율 80% 요건, 회계연도 전환 시 비례계산 등
         세부 사항은 실제 급여관리 자료와 대조해 확인하세요.
@@ -516,9 +658,18 @@ export default function LeaveLedger() {
                 <DetailStat label="사용" value={`${selected.usedHours}시간`} />
                 <DetailStat label="잔여" value={`${selected.remaining.toFixed(2)}일`} strong />
               </div>
-              <div style={styles.basisLine}>{selected.basis} · 8시간 = 1일로 환산</div>
+              <div style={styles.basisLine}>{selected.basis} · {HOURS_PER_DAY}시간 = 1일로 환산</div>
 
               <PassbookBar used={selected.used} accrued={selected.accrued} big />
+
+              {selectedAbs && selectedAbs.totalExcess > 0 && (
+                <div style={styles.absBox}>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>연차 초과(결근) 누적 {fmtDH(selectedAbs.totalExcess)}</div>
+                  <div>
+                    전체 공제 {Math.floor(selectedAbs.totalExcess / HOURS_PER_DAY)}일 · 이월 {selectedAbs.totalExcess % HOURS_PER_DAY}시간
+                  </div>
+                </div>
+              )}
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18, marginBottom: 6 }}>
                 <div style={styles.cardTitleSmall}>사용 내역</div>
@@ -535,7 +686,7 @@ export default function LeaveLedger() {
                       <div style={styles.logDate}>{l.date}</div>
                       {l.note && <div style={styles.logNote}>{l.note}</div>}
                     </div>
-                    <div style={styles.logDays}>{l.hours ?? (l.days || 0) * 8}시간</div>
+                    <div style={styles.logDays}>{l.hours ?? (l.days || 0) * HOURS_PER_DAY}시간</div>
                     <button style={styles.iconBtnGhost} onClick={() => removeLog(selected.id, l.id)} aria-label="삭제">
                       <X size={14} />
                     </button>
@@ -689,7 +840,7 @@ function AddWorkerForm({ onSubmit, onCancel, initial, submitLabel }) {
 
 function AddLogForm({ onSubmit, onCancel }) {
   const [date, setDate] = useState(toISO(new Date()));
-  const [hours, setHours] = useState(8);
+  const [hours, setHours] = useState(HOURS_PER_DAY);
   const [note, setNote] = useState("");
 
   const submit = () => {
@@ -702,7 +853,7 @@ function AddLogForm({ onSubmit, onCancel }) {
       <Field label="사용일">
         <input type="date" style={styles.input} value={date} onChange={(e) => setDate(e.target.value)} />
       </Field>
-      <Field label="사용 시간 (1시간 단위, 8시간 = 1일)">
+      <Field label={`사용 시간 (1시간 단위, ${HOURS_PER_DAY}시간 = 1일)`}>
         <input
           type="number"
           min="1"
@@ -899,6 +1050,25 @@ const styles = {
     fontSize: 12.5, padding: "8px 0", borderRadius: 8,
     border: "1px solid #E3C7C0", background: "#fff", color: "var(--rust)",
     cursor: "pointer", fontFamily: "var(--font-body)", fontWeight: 500,
+  },
+  absSummary: {
+    display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap",
+    fontSize: 12.5, color: "var(--ink-soft)", padding: "6px 2px 8px",
+    borderBottom: "1px solid var(--line)",
+  },
+  absRow: {
+    display: "flex", alignItems: "center", gap: 10,
+    padding: "11px 4px", borderBottom: "1px solid var(--line)", cursor: "pointer",
+  },
+  absDetail: { fontSize: 11.5, color: "var(--ink-soft)", marginTop: 2 },
+  absDeduct: {
+    fontFamily: "var(--font-mono)", fontSize: 13, fontWeight: 700, color: "var(--rust)",
+    flexShrink: 0, whiteSpace: "nowrap",
+  },
+  absDeductZero: { fontSize: 12, color: "var(--ink-soft)", flexShrink: 0, whiteSpace: "nowrap" },
+  absBox: {
+    marginTop: 12, padding: "10px 12px", borderRadius: 8,
+    background: "#F3E4E1", color: "#7A3529", fontSize: 12.5, lineHeight: 1.55,
   },
   confirmBar: {
     marginTop: 10, padding: "10px 12px", borderRadius: 8,
