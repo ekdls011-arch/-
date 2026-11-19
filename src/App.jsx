@@ -13,6 +13,7 @@ import {
    ============================================================ */
 
 const STORAGE_KEY = "leave-ledger-data";
+const DEFAULT_SETTINGS = { scheduledDays: 245 }; // 연간 소정근로일수 기본값 (화면 하단 '설정'에서 변경)
 const HOURS_PER_DAY = 6; // 1일 = 6시간 기준 환산 (이 기관 근로자 기준)
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -31,20 +32,68 @@ function tenure(hireDate, asOf) {
   return { years, months, totalMonths };
 }
 
-// 근로기준법 제60조 기반 간이 계산 (실제 적용 시 전년도 출근율 80%, 회계연도 전환 비례계산 등
-// 세부 요건을 별도 검토해야 함 — 이 도구는 개략적 추정치를 제공)
-function calcAccrued(hireDateStr, asOf) {
-  const hireDate = new Date(hireDateStr + "T00:00:00");
-  if (hireDate > asOf) return { accrued: 0, basis: "입사 전" };
-  const { years, totalMonths } = tenure(hireDate, asOf);
+// 회계연도(1.1~12.31) 기준 근속년수별 연차일수표 — 기관 엑셀의 (수정된) 표와 동일
+// [근속년수(이상), 연차일수]  ※ 근속년수 = 해당 연도 − 입사 연도
+const TENURE_TABLE = [
+  [0, 11], [1, 15], [3, 16], [5, 17], [7, 18], [9, 19], [11, 20],
+  [13, 21], [15, 22], [17, 23], [19, 24], [21, 25],
+];
 
-  if (years < 1) {
+// 회계연도 기준 연차 부여 일수
+//  - 입사 연도: 월 개근 시 1일씩(최대 11일) 월차로 부여
+//  - 입사 다음 해: 입사 연도에 쓰지 않고 남은 월차는 이월해서 더함
+//  - 입사 다음 해 1.1 시점에 근속 1년 미만: 비례연차 = 올림(입사일~전년 12.31 일수 ÷ 365 × 15)
+//    + 월차(1주년까지 월 1일씩 계속 발생, 입사 후 통틀어 최대 11일 — 지난해 발생분은 제외)
+//  - 그 외: 근속년수(연도 차이)를 위 표에서 조회
+// prevYearUsedHours: 지난해 사용 시간 (이월 월차 계산용)
+function calcAccrued(hireDateStr, year, asOf, prevYearUsedHours = 0) {
+  const hire = new Date(hireDateStr + "T00:00:00");
+  const hireYear = hire.getFullYear();
+  if (year < hireYear || hire > asOf) return { accrued: 0, basis: "입사 전" };
+
+  if (year === hireYear) {
+    const { totalMonths } = tenure(hire, asOf);
     const accrued = Math.min(totalMonths, 11);
-    return { accrued, basis: `입사 ${totalMonths}개월차 · 월 1일 개근 가산` };
+    return { accrued, basis: `입사 연도 · 월차 ${totalMonths}개월 개근 (월 1일)` };
   }
-  const extra = Math.floor((years - 1) / 2);
-  const accrued = Math.min(15 + extra, 25);
-  return { accrued, basis: `근속 ${years}년차 · 기본 15일 + 가산 ${extra}일` };
+
+  // 입사 연도에 발생했지만 쓰지 못한 월차는 다음 해로 이월
+  let carry = 0;
+  if (year === hireYear + 1) {
+    const earnedMonths = Math.min(11, tenure(hire, new Date(hireYear, 11, 31)).totalMonths);
+    carry = Math.max(0, earnedMonths * HOURS_PER_DAY - prevYearUsedHours) / HOURS_PER_DAY;
+  }
+  const carryNote = carry > 0 ? ` + 지난해 월차 이월 ${fmtDays(carry)}` : "";
+
+  const jan1 = new Date(year, 0, 1);
+  const { years: yearsAtJan1 } = tenure(hire, jan1);
+  if (yearsAtJan1 < 1) {
+    const days = Math.round((jan1 - hire) / 86400000);
+    const prorated = Math.ceil((days * 15) / 365 - 1e-9);
+    // 월차: 지난해에 이미 발생한 개월 수는 빼고, 올해 새로 개근한 만큼만 더함 (입사 후 최대 11일)
+    const monthsSoFar = Math.min(11, tenure(hire, asOf).totalMonths);
+    const monthsLastYear = Math.min(11, tenure(hire, new Date(year - 1, 11, 31)).totalMonths);
+    const monthly = Math.max(0, monthsSoFar - monthsLastYear);
+    return {
+      accrued: prorated + monthly + carry,
+      basis: `비례연차 ${prorated}일 (입사일~전년 말 ${days}일 ÷ 365 × 15, 올림) + 월차 ${monthly}일${carryNote}`,
+    };
+  }
+
+  const n = year - hireYear;
+  let tableDays = 0;
+  TENURE_TABLE.forEach(([minYears, d]) => {
+    if (n >= minYears) tableDays = d;
+  });
+  return {
+    accrued: tableDays + carry,
+    basis: `${year}년 회계연도 · 입사 ${n}년차 (표 기준 ${tableDays}일)${carryNote}`,
+  };
+}
+
+// 선택한 회계연도(해당 연도 1.1~12.31)의 사용 기록만 골라냄
+function logsInYear(list, year) {
+  return (list || []).filter((l) => (l.date || "").startsWith(`${year}-`));
 }
 
 // 기록 1건의 사용 시간. 예전 버전에서 만든 '일' 단위 기록(days)도 1일=6시간으로 환산해 인식
@@ -53,9 +102,24 @@ function logHours(l) {
   return (Number(l.days) || 0) * HOURS_PER_DAY;
 }
 
-// 사용 시간 합계(시간 단위)
+// 휴가 종류
+//  - 연차: 잔여 연차에서 차감, 부여를 넘긴 시간은 결근(공제 대상)
+//  - 유급병가·공가: 연차 차감 없음, 공제 없음, 출근으로 처리
+//  - 무급병가: 연차 차감 없음, 결근과 같은 방식으로 공제 대상이며 출근율에서도 결근으로 처리
+//  ※ 예전에 등록한 기록은 종류가 없으므로 모두 '연차'로 취급
+const LEAVE_TYPES = {
+  annual: { label: "연차", hint: "잔여 연차에서 차감돼요." },
+  paidSick: { label: "유급병가", hint: "연차를 차감하지 않고 공제도 없어요. 출근으로 처리해요." },
+  unpaidSick: { label: "무급병가", hint: "연차를 차감하지 않고, 결근과 같은 방식으로 월급 공제 대상이 돼요." },
+  official: { label: "공가", hint: "연차를 차감하지 않고 공제도 없어요. 출근으로 처리해요." },
+};
+const logType = (l) => (l && LEAVE_TYPES[l.type] ? l.type : "annual");
+const sumByType = (list, type) =>
+  (list || []).filter((l) => logType(l) === type).reduce((s, l) => s + logHours(l), 0);
+
+// 연차 사용 시간 합계(시간 단위) — 병가·공가는 포함하지 않음
 function usedHours(logs) {
-  return logs.reduce((sum, l) => sum + logHours(l), 0);
+  return logs.filter((l) => logType(l) === "annual").reduce((sum, l) => sum + logHours(l), 0);
 }
 
 // "N일 M시간" 형태로 표시 (6시간 = 1일)
@@ -68,14 +132,21 @@ function fmtDH(hours) {
   return `${d}일 ${h}시간`;
 }
 
+// 일수(소수 가능)를 "N일 M시간"으로 표시 — 이월 월차처럼 시간 단위가 섞인 경우용
+function fmtDays(d) {
+  if (Number.isInteger(d)) return `${d}일`;
+  return fmtDH(Math.round(d * HOURS_PER_DAY));
+}
+
 // 연차 초과분(= 결근) 계산.
 //  - 사용 기록을 날짜순으로 쌓아가며, 부여 연차(시간)를 넘어선 구간만 '결근 시간'으로 봄
 //  - 공제는 누적 결근 시간을 6시간(1일) 단위로 끊어서, 월별로 새로 채워진 일수만큼만 공제
 //  - 6시간이 안 되는 나머지는 다음 달로 이월되어 1일이 채워지는 달에 공제
 // month: "YYYY-MM" (공제를 보려는 달)
 function calcAbsence(logs, accruedDays, month) {
-  const limitH = accruedDays * HOURS_PER_DAY;
+  const limitH = Math.round(accruedDays * HOURS_PER_DAY);
   const sorted = logs
+    .filter((l) => logType(l) === "annual")
     .map((l, i) => ({ date: l.date || "", h: logHours(l), i }))
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.i - b.i));
 
@@ -92,6 +163,16 @@ function calcAbsence(logs, accruedDays, month) {
     }
   });
 
+  // 무급병가는 연차와 상관없이 해당 월의 결근 시간으로 더함
+  let unpaidTotal = 0;
+  logs.forEach((l) => {
+    if (logType(l) !== "unpaidSick") return;
+    const h = logHours(l);
+    const ym = (l.date || "").slice(0, 7);
+    excessByMonth[ym] = (excessByMonth[ym] || 0) + h;
+    unpaidTotal += h;
+  });
+
   let cumBefore = 0; // 선택한 달 이전까지의 누적 결근 시간
   let monthExcess = 0; // 선택한 달에 새로 생긴 결근 시간
   Object.keys(excessByMonth).forEach((ym) => {
@@ -102,8 +183,27 @@ function calcAbsence(logs, accruedDays, month) {
   const deductDays = Math.floor(cumThrough / HOURS_PER_DAY) - Math.floor(cumBefore / HOURS_PER_DAY);
   const carryIn = cumBefore % HOURS_PER_DAY; // 지난달에서 넘어온 시간
   const carryOut = cumThrough % HOURS_PER_DAY; // 다음 달로 넘어갈 시간
-  const totalExcess = Math.max(0, cum - limitH); // 전체 기간 누적 결근 시간
+  const totalExcess = Math.max(0, cum - limitH) + unpaidTotal; // 전체 기간 누적 결근 시간 (연차 초과 + 무급병가)
   return { monthExcess, cumBefore, cumThrough, deductDays, carryIn, carryOut, totalExcess };
+}
+
+// 전년도 출근율 = (소정근로일수 − 결근일수) ÷ 소정근로일수
+//  - 결근일수 = 전년도 연차 초과분(결근) 시간을 1일(6시간) 단위로 환산 (연차를 쓴 날은 출근으로 봄)
+//  - 입사 연도에 근무를 시작한 경우 근무 기간만큼 소정근로일수를 비례해서 줄임
+//  - 앱에 기록된 연차 사용/초과분만 쓰는 추정치 (다른 무급 결근·휴직은 반영되지 않음)
+function calcAttendance(hireDateStr, prevYear, prevLogs, prevAccrued, scheduledDays) {
+  const hire = new Date(hireDateStr + "T00:00:00");
+  if (hire.getFullYear() > prevYear) return null;
+  let sched = scheduledDays;
+  if (hire.getFullYear() === prevYear) {
+    const days = Math.round((new Date(prevYear, 11, 31) - hire) / 86400000) + 1;
+    sched = Math.round((scheduledDays * days) / 365);
+  }
+  if (!(sched > 0)) return null;
+  const absentHours = calcAbsence(prevLogs, prevAccrued, `${prevYear}-12`).totalExcess;
+  const absentDays = absentHours / HOURS_PER_DAY;
+  const rate = Math.max(0, (sched - absentDays) / sched);
+  return { rate, absentDays, sched, prevYear, below: rate < 0.8 };
 }
 
 const seedWorkers = () => {
@@ -159,6 +259,8 @@ export default function LeaveLedger() {
   const [selectedDept, setSelectedDept] = useState("전체");
   const [selectedStatus, setSelectedStatus] = useState("전체");
   const [absMonth, setAbsMonth] = useState(() => toISO(new Date()).slice(0, 7));
+  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [sharedMode, setSharedMode] = useState(false);
   const [showShareConfirm, setShowShareConfirm] = useState(false);
 
@@ -178,6 +280,7 @@ export default function LeaveLedger() {
           const parsed = JSON.parse(res.value);
           setWorkers(parsed.workers || []);
           setLogs(parsed.logs || {});
+          setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
         } else {
           const w = seedWorkers();
           setWorkers(w);
@@ -194,11 +297,11 @@ export default function LeaveLedger() {
   }, []);
 
   // 저장 (workers/logs 변경 시)
-  const persist = useCallback(async (nextWorkers, nextLogs, shared) => {
+  const persist = useCallback(async (nextWorkers, nextLogs, shared, nextSettings) => {
     try {
       const result = await window.storage.set(
         STORAGE_KEY,
-        JSON.stringify({ workers: nextWorkers, logs: nextLogs }),
+        JSON.stringify({ workers: nextWorkers, logs: nextLogs, settings: nextSettings }),
         shared
       );
       if (!result) setSaveError(true);
@@ -210,26 +313,49 @@ export default function LeaveLedger() {
 
   useEffect(() => {
     if (!loading && workers && logs) {
-      persist(workers, logs, sharedMode);
+      persist(workers, logs, sharedMode, settings);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workers, logs, sharedMode]);
+  }, [workers, logs, sharedMode, settings]);
 
   const rows = useMemo(() => {
     if (!workers) return [];
+    const scheduledDays = Number(settings.scheduledDays) > 0 ? Number(settings.scheduledDays) : DEFAULT_SETTINGS.scheduledDays;
+    const accruedFor = (w, y) => {
+      const asOfY = y >= today.getFullYear() ? today : new Date(y, 11, 31);
+      const prevUsed = usedHours(logsInYear(logs?.[w.id], y - 1));
+      return calcAccrued(w.hireDate, y, asOfY, prevUsed);
+    };
     return workers.map((w) => {
-      const { accrued, basis } = calcAccrued(w.hireDate, today);
-      const usedH = usedHours(logs?.[w.id] || []);
+      const { accrued, basis } = accruedFor(w, year);
+      const usedH = usedHours(logsInYear(logs?.[w.id], year));
       const used = usedH / HOURS_PER_DAY;
       const remaining = Math.max(accrued - used, 0);
       const usageRate = accrued > 0 ? used / accrued : 0;
       const monthsLeftInYear = 12 - (today.getMonth() + 1);
-      const atRisk = accrued > 0 && usageRate < 0.3 && monthsLeftInYear <= 3;
+      const atRisk = year === today.getFullYear() && accrued > 0 && usageRate < 0.3 && monthsLeftInYear <= 3;
       const { years: tenureYears } = tenure(new Date(w.hireDate + "T00:00:00"), today);
       const status = tenureYears < 1 ? "1년 미만 근로인" : "근로인";
-      return { ...w, accrued, basis, used, usedHours: usedH, remaining, usageRate, atRisk, status };
+      const att = calcAttendance(
+        w.hireDate, year - 1, logsInYear(logs?.[w.id], year - 1), accruedFor(w, year - 1).accrued, scheduledDays
+      );
+      return { ...w, accrued, basis, used, usedHours: usedH, remaining, usageRate, atRisk, status, att };
     });
-  }, [workers, logs, today]);
+  }, [workers, logs, today, year, settings]);
+
+  const yearOptions = useMemo(() => {
+    const cur = today.getFullYear();
+    const hireYears = (workers || []).map((w) => Number((w.hireDate || "").slice(0, 4)) || cur);
+    const minY = Math.min(cur, ...hireYears);
+    const arr = [];
+    for (let y = cur; y >= minY; y--) arr.push(y);
+    return arr;
+  }, [workers, today]);
+
+  const changeYear = (y) => {
+    setYear(y);
+    setAbsMonth(y === today.getFullYear() ? toISO(today).slice(0, 7) : `${y}-12`);
+  };
 
   const depts = useMemo(() => {
     const set = new Set(rows.map((r) => r.dept));
@@ -255,7 +381,8 @@ export default function LeaveLedger() {
       ? filteredRows.reduce((s, r) => s + r.usageRate, 0) / filteredRows.length
       : 0;
     const atRiskCount = filteredRows.filter((r) => r.atRisk).length;
-    return { totalAccrued, totalUsed, avgRate, atRiskCount };
+    const lowAttCount = filteredRows.filter((r) => r.att && r.att.below).length;
+    return { totalAccrued, totalUsed, avgRate, atRiskCount, lowAttCount };
   }, [filteredRows]);
 
   const chartData = useMemo(
@@ -270,9 +397,9 @@ export default function LeaveLedger() {
   const absenceRows = useMemo(
     () =>
       filteredRows
-        .map((r) => ({ ...r, abs: calcAbsence(logs?.[r.id] || [], r.accrued, absMonth) }))
+        .map((r) => ({ ...r, abs: calcAbsence(logsInYear(logs?.[r.id], year), r.accrued, absMonth) }))
         .filter((r) => r.abs.cumThrough > 0 || r.abs.monthExcess > 0),
-    [filteredRows, logs, absMonth]
+    [filteredRows, logs, absMonth, year]
   );
 
   const absenceTotals = useMemo(
@@ -285,8 +412,14 @@ export default function LeaveLedger() {
 
   const selected = rows.find((r) => r.id === selectedId) || null;
   const selectedAbs = selected
-    ? calcAbsence(logs?.[selected.id] || [], selected.accrued, absMonth)
+    ? calcAbsence(logsInYear(logs?.[selected.id], year), selected.accrued, absMonth)
     : null;
+  const selectedYearLogs = selected ? logsInYear(logs?.[selected.id], year) : [];
+  const selectedOther = selected
+    ? ["paidSick", "unpaidSick", "official"]
+        .map((k) => ({ k, h: sumByType(selectedYearLogs, k) }))
+        .filter((x) => x.h > 0)
+    : [];
 
   const addWorker = (data) => {
     const w = { id: uid(), ...data };
@@ -332,9 +465,10 @@ export default function LeaveLedger() {
         const parsed = JSON.parse(res.value);
         setWorkers(parsed.workers || []);
         setLogs(parsed.logs || {});
+        setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
       } else if (nextShared) {
         // 공유 저장소가 비어있으면 현재 데이터를 그대로 복사해 시작
-        await window.storage.set(STORAGE_KEY, JSON.stringify({ workers, logs }), true);
+        await window.storage.set(STORAGE_KEY, JSON.stringify({ workers, logs, settings }), true);
       } else {
         const w = seedWorkers();
         setWorkers(w);
@@ -364,18 +498,23 @@ export default function LeaveLedger() {
       소속: r.dept,
       구분: r.status,
       입사일: r.hireDate,
-      부여일수: r.accrued,
+      부여일수: Number(r.accrued.toFixed(2)),
       사용시간: r.usedHours,
       사용일수: Number(r.used.toFixed(2)),
+      "유급병가(시간)": sumByType(logsInYear(logs?.[r.id], year), "paidSick"),
+      "무급병가(시간)": sumByType(logsInYear(logs?.[r.id], year), "unpaidSick"),
+      "공가(시간)": sumByType(logsInYear(logs?.[r.id], year), "official"),
       잔여일수: Number(r.remaining.toFixed(2)),
       소진율: `${Math.round(r.usageRate * 100)}%`,
+      전년도출근율: r.att ? `${(r.att.rate * 100).toFixed(1)}%` : "-",
+      "출근율 80% 미만": r.att ? (r.att.below ? "예" : "아니오") : "-",
       비고: r.basis,
     }));
     const ws = XLSX.utils.json_to_sheet(data);
-    ws["!cols"] = [{ wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 30 }];
+    ws["!cols"] = [{ wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 8 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 8 }, { wch: 8 }, { wch: 12 }, { wch: 14 }, { wch: 40 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "연차현황");
-    const filename = `연차현황_${selectedDept}_${toISO(today)}.xlsx`;
+    const filename = `연차현황_${year}년_${selectedDept}_${toISO(today)}.xlsx`;
     XLSX.writeFile(wb, filename);
   };
 
@@ -426,7 +565,7 @@ export default function LeaveLedger() {
       {/* Summary strip */}
       <section style={styles.statGrid}>
         <StatCard label="전체 인원" value={`${rows.length}명`} />
-        <StatCard label="총 부여 연차" value={`${totals.totalAccrued}일`} />
+        <StatCard label="총 부여 연차" value={fmtDays(totals.totalAccrued)} />
         <StatCard label="총 사용 연차" value={`${totals.totalUsed.toFixed(1)}일`} />
         <StatCard
           label="평균 소진율"
@@ -441,6 +580,16 @@ export default function LeaveLedger() {
           <span>
             소진율이 낮아 연차 소멸이 우려되는 인원이{" "}
             <strong>{totals.atRiskCount}명</strong> 있어요. 아래 목록에서 확인하세요.
+          </span>
+        </div>
+      )}
+
+      {totals.lowAttCount > 0 && (
+        <div style={{ ...styles.alertBanner, background: "#F3E4E1", color: "#7A3529", border: "1px solid #E3C7C0" }}>
+          <AlertTriangle size={16} color="#7A3529" strokeWidth={2} style={{ flexShrink: 0 }} />
+          <span>
+            전년도({year - 1}년) 출근율이 80% 미만으로 계산된 인원이{" "}
+            <strong>{totals.lowAttCount}명</strong> 있어요. 해당 인원의 연차 부여 기준을 확인하세요.
           </span>
         </div>
       )}
@@ -492,6 +641,16 @@ export default function LeaveLedger() {
             </button>
           ))}
         </div>
+        <select
+          value={year}
+          onChange={(e) => changeYear(Number(e.target.value))}
+          style={{ ...styles.chip, paddingRight: 6 }}
+          aria-label="기준 연도"
+        >
+          {yearOptions.map((y) => (
+            <option key={y} value={y}>{y}년 (회계연도)</option>
+          ))}
+        </select>
       </section>
 
       {/* Chart */}
@@ -543,12 +702,13 @@ export default function LeaveLedger() {
                     {r.status === "1년 미만 근로인" ? "1년 미만" : "근로인"}
                   </span>
                   {r.atRisk && <span style={styles.riskTag}>소멸 임박</span>}
+                  {r.att && r.att.below && <span style={styles.lowAttTag}>출근율 80%↓</span>}
                 </div>
                 <PassbookBar used={r.used} accrued={r.accrued} />
               </div>
               <div style={styles.rowNums}>
                 <div style={styles.rowRemaining}>{r.remaining.toFixed(1)}<span style={styles.rowUnit}>일 잔여</span></div>
-                <div style={styles.rowSub}>{r.usedHours}시간 사용 · {r.accrued}일 부여</div>
+                <div style={styles.rowSub}>{r.usedHours}시간 사용 · {fmtDays(r.accrued)} 부여</div>
               </div>
               <ChevronRight size={16} color="#8A968F" style={{ flexShrink: 0 }} />
             </div>
@@ -569,7 +729,9 @@ export default function LeaveLedger() {
             <input
               type="month"
               value={absMonth}
-              onChange={(e) => e.target.value && setAbsMonth(e.target.value)}
+              min={`${year}-01`}
+              max={`${year}-12`}
+              onChange={(e) => e.target.value && e.target.value.startsWith(`${year}-`) && setAbsMonth(e.target.value)}
               style={{ ...styles.input, width: "auto", padding: "5px 8px", fontSize: 12.5 }}
             />
             <button style={styles.iconTextBtn} onClick={exportAbsenceExcel}>
@@ -610,13 +772,30 @@ export default function LeaveLedger() {
         </div>
         <div style={{ ...styles.footNote, padding: "10px 2px 4px" }}>
           부여 연차를 모두 쓴 뒤의 사용 시간을 결근으로 보고, 누적 {HOURS_PER_DAY}시간(1일)이 채워질 때마다 1일씩 공제합니다.
-          {HOURS_PER_DAY}시간이 안 되는 시간은 다음 달로 이월돼요.
+          {HOURS_PER_DAY}시간이 안 되는 시간은 다음 달로 이월돼요. 회계연도(1.1~12.31)마다 새로 계산하고 연말 이월은 없어요. 무급병가도 같은 방식으로 공제하고, 유급병가·공가는 연차 차감과 공제 없이 출근으로 처리해요.
         </div>
       </section>
 
+      {/* 설정 */}
+      <section style={styles.card}>
+        <div style={styles.cardTitle}>설정</div>
+        <Field label="연간 소정근로일수 (전년도 출근율 계산에 사용 · 휴일 제외, 주 5일 근무면 보통 240~250일)">
+          <input
+            type="number"
+            min="1"
+            max="366"
+            step="1"
+            style={styles.input}
+            value={settings.scheduledDays}
+            onChange={(e) =>
+              setSettings({ ...settings, scheduledDays: e.target.value === "" ? "" : Number(e.target.value) })
+            }
+          />
+        </Field>
+      </section>
+
       <div style={styles.footNote}>
-        * 연차 부여 일수는 근로기준법 제60조를 기준으로 한 간이 계산치입니다. 전년도 출근율 80% 요건, 회계연도 전환 시 비례계산 등
-        세부 사항은 실제 급여관리 자료와 대조해 확인하세요.
+        * 연차는 회계연도(1.1~12.31) 기준입니다. 입사 연도는 월차(월 1일, 최대 11일, 쓰지 않은 월차는 다음 해로 이월), 입사 다음 해 1.1에 근속 1년 미만이면 비례연차(올림)에 월차를 더해서, 그 외는 근속년수표를 따릅니다. 전년도 출근율은 앱에 기록된 연차 초과 결근만으로 계산한 추정치이니, 세부 사항은 실제 근태·급여 자료와 대조해 확인하세요.
       </div>
 
       {/* Detail modal */}
@@ -654,7 +833,7 @@ export default function LeaveLedger() {
               )}
 
               <div style={styles.detailStatRow}>
-                <DetailStat label="부여" value={`${selected.accrued}일`} />
+                <DetailStat label="부여" value={fmtDays(selected.accrued)} />
                 <DetailStat label="사용" value={`${selected.usedHours}시간`} />
                 <DetailStat label="잔여" value={`${selected.remaining.toFixed(2)}일`} strong />
               </div>
@@ -662,9 +841,28 @@ export default function LeaveLedger() {
 
               <PassbookBar used={selected.used} accrued={selected.accrued} big />
 
+              {selected.att && (
+                <div style={selected.att.below ? styles.absBox : styles.attBox}>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                    {selected.att.prevYear}년 출근율 {(selected.att.rate * 100).toFixed(1)}% · {selected.att.below ? "80% 미만" : "80% 이상"}
+                  </div>
+                  <div>소정근로일 {selected.att.sched}일 중 결근 {selected.att.absentDays.toFixed(1)}일 (연차 초과분 기준)</div>
+                  {selected.att.below && (
+                    <div>법정 연차 대신 월 개근 시 1일씩만 발생하는 대상일 수 있어요. 부여 일수에는 자동 반영하지 않았어요.</div>
+                  )}
+                </div>
+              )}
+
+              {selectedOther.length > 0 && (
+                <div style={styles.attBox}>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>병가·공가 사용 ({year}년)</div>
+                  <div>{selectedOther.map((x) => `${LEAVE_TYPES[x.k].label} ${fmtDH(x.h)}`).join(" · ")}</div>
+                </div>
+              )}
+
               {selectedAbs && selectedAbs.totalExcess > 0 && (
                 <div style={styles.absBox}>
-                  <div style={{ fontWeight: 600, marginBottom: 2 }}>연차 초과(결근) 누적 {fmtDH(selectedAbs.totalExcess)}</div>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>연차 초과·무급병가(결근) 누적 {fmtDH(selectedAbs.totalExcess)}</div>
                   <div>
                     전체 공제 {Math.floor(selectedAbs.totalExcess / HOURS_PER_DAY)}일 · 이월 {selectedAbs.totalExcess % HOURS_PER_DAY}시간
                   </div>
@@ -672,18 +870,21 @@ export default function LeaveLedger() {
               )}
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 18, marginBottom: 6 }}>
-                <div style={styles.cardTitleSmall}>사용 내역</div>
+                <div style={styles.cardTitleSmall}>사용 내역 ({year}년)</div>
                 <button style={styles.addBtnSmall} onClick={() => setShowAddLog(true)}>
                   <Plus size={13} strokeWidth={2.5} /> 사용 등록
                 </button>
               </div>
 
               <div>
-                {(logs[selected.id] || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((l) => (
+                {selectedYearLogs.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((l) => (
                   <div key={l.id} style={styles.logRow}>
                     <CalendarDays size={14} color="#5B6663" style={{ flexShrink: 0 }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={styles.logDate}>{l.date}</div>
+                      <div style={styles.logDate}>
+                        {l.date}
+                        {logType(l) !== "annual" && <span style={styles.typeTag}>{LEAVE_TYPES[logType(l)].label}</span>}
+                      </div>
                       {l.note && <div style={styles.logNote}>{l.note}</div>}
                     </div>
                     <div style={styles.logDays}>{l.hours ?? (l.days || 0) * HOURS_PER_DAY}시간</div>
@@ -692,7 +893,7 @@ export default function LeaveLedger() {
                     </button>
                   </div>
                 ))}
-                {(logs[selected.id] || []).length === 0 && (
+                {selectedYearLogs.length === 0 && (
                   <div style={{ color: "var(--ink-soft)", fontSize: 13, padding: "10px 0" }}>
                     아직 사용 기록이 없어요.
                   </div>
@@ -842,18 +1043,29 @@ function AddLogForm({ onSubmit, onCancel }) {
   const [date, setDate] = useState(toISO(new Date()));
   const [hours, setHours] = useState(HOURS_PER_DAY);
   const [note, setNote] = useState("");
+  const [type, setType] = useState("annual");
 
   const submit = () => {
     if (!date || !hours) return;
-    onSubmit({ date, hours: Math.round(Number(hours)), note: note.trim() });
+    onSubmit({ date, hours: Math.round(Number(hours)), type, note: note.trim() });
   };
 
   return (
     <div style={{ marginTop: 12 }}>
+      <Field label="휴가 종류">
+        <select style={styles.input} value={type} onChange={(e) => setType(e.target.value)}>
+          {Object.entries(LEAVE_TYPES).map(([k, v]) => (
+            <option key={k} value={k}>{v.label}</option>
+          ))}
+        </select>
+        <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginTop: 4, lineHeight: 1.5 }}>
+          {LEAVE_TYPES[type].hint}
+        </div>
+      </Field>
       <Field label="사용일">
         <input type="date" style={styles.input} value={date} onChange={(e) => setDate(e.target.value)} />
       </Field>
-      <Field label={`사용 시간 (1시간 단위, ${HOURS_PER_DAY}시간 = 1일)`}>
+      <Field label={`시간 (1시간 단위, ${HOURS_PER_DAY}시간 = 1일)`}>
         <input
           type="number"
           min="1"
@@ -1069,6 +1281,18 @@ const styles = {
   absBox: {
     marginTop: 12, padding: "10px 12px", borderRadius: 8,
     background: "#F3E4E1", color: "#7A3529", fontSize: 12.5, lineHeight: 1.55,
+  },
+  typeTag: {
+    marginLeft: 6, fontSize: 10.5, padding: "1px 6px", borderRadius: 10, fontWeight: 600,
+    background: "#E3ECF7", color: "#2C5C86", fontFamily: "var(--font-body)",
+  },
+  attBox: {
+    marginTop: 12, padding: "10px 12px", borderRadius: 8,
+    background: "#E7EFEA", color: "#2B4A41", fontSize: 12.5, lineHeight: 1.55,
+  },
+  lowAttTag: {
+    fontSize: 10, background: "#F3E4E1", color: "#7A3529",
+    padding: "1px 6px", borderRadius: 10, fontWeight: 600,
   },
   confirmBar: {
     marginTop: 10, padding: "10px 12px", borderRadius: 8,
