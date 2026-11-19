@@ -46,22 +46,44 @@ const TENURE_TABLE = [
 //    + 월차(1주년까지 월 1일씩 계속 발생, 입사 후 통틀어 최대 11일 — 지난해 발생분은 제외)
 //  - 그 외: 근속년수(연도 차이)를 위 표에서 조회
 // prevYearUsedHours: 지난해 사용 시간 (이월 월차 계산용)
-function calcAccrued(hireDateStr, year, asOf, prevYearUsedHours = 0) {
+// missed: 만근하지 못해 월차가 발생하지 않은 개월차 번호 배열 (입사 후 k번째 달, 예: [2, 5])
+
+// 입사 후 k개월차(k=1~11)마다 만근하면 월차 1일. 미만근 달은 제외하고 totalMonths까지 발생한 일수를 셈
+function monthlyEarned(totalMonths, missed) {
+  const upto = Math.min(11, totalMonths);
+  let n = 0;
+  for (let k = 1; k <= upto; k++) if (!(missed || []).includes(k)) n++;
+  return n;
+}
+
+// 날짜에 개월 수를 더함 (말일 초과 시 그 달 말일로 맞춤)
+function addMonths(d, m) {
+  const r = new Date(d.getFullYear(), d.getMonth() + m, 1);
+  const last = new Date(r.getFullYear(), r.getMonth() + 1, 0).getDate();
+  r.setDate(Math.min(d.getDate(), last));
+  return r;
+}
+
+function calcAccrued(hireDateStr, year, asOf, prevYearUsedHours = 0, missed = []) {
   const hire = new Date(hireDateStr + "T00:00:00");
   const hireYear = hire.getFullYear();
   if (year < hireYear || hire > asOf) return { accrued: 0, basis: "입사 전" };
 
   if (year === hireYear) {
     const { totalMonths } = tenure(hire, asOf);
-    const accrued = Math.min(totalMonths, 11);
-    return { accrued, basis: `입사 연도 · 월차 ${totalMonths}개월 개근 (월 1일)` };
+    const accrued = monthlyEarned(totalMonths, missed);
+    const skipped = Math.min(11, totalMonths) - accrued;
+    return {
+      accrued,
+      basis: `입사 연도 · 월차 ${accrued}일 (${Math.min(11, totalMonths)}개월 중 만근 ${accrued}개월${skipped > 0 ? `, 미만근 ${skipped}개월 제외` : ""})`,
+    };
   }
 
   // 입사 연도에 발생했지만 쓰지 못한 월차는 다음 해로 이월
   let carry = 0;
   if (year === hireYear + 1) {
-    const earnedMonths = Math.min(11, tenure(hire, new Date(hireYear, 11, 31)).totalMonths);
-    carry = Math.max(0, earnedMonths * HOURS_PER_DAY - prevYearUsedHours) / HOURS_PER_DAY;
+    const earnedDays = monthlyEarned(tenure(hire, new Date(hireYear, 11, 31)).totalMonths, missed);
+    carry = Math.max(0, earnedDays * HOURS_PER_DAY - prevYearUsedHours) / HOURS_PER_DAY;
   }
   const carryNote = carry > 0 ? ` + 지난해 월차 이월 ${fmtDays(carry)}` : "";
 
@@ -71,9 +93,11 @@ function calcAccrued(hireDateStr, year, asOf, prevYearUsedHours = 0) {
     const days = Math.round((jan1 - hire) / 86400000);
     const prorated = Math.ceil((days * 15) / 365 - 1e-9);
     // 월차: 지난해에 이미 발생한 개월 수는 빼고, 올해 새로 개근한 만큼만 더함 (입사 후 최대 11일)
-    const monthsSoFar = Math.min(11, tenure(hire, asOf).totalMonths);
-    const monthsLastYear = Math.min(11, tenure(hire, new Date(year - 1, 11, 31)).totalMonths);
-    const monthly = Math.max(0, monthsSoFar - monthsLastYear);
+    const monthsNow = tenure(hire, asOf).totalMonths;
+    const monthly = Math.max(
+      0,
+      monthlyEarned(monthsNow, missed) - monthlyEarned(tenure(hire, new Date(year - 1, 11, 31)).totalMonths, missed)
+    );
     return {
       accrued: prorated + monthly + carry,
       basis: `비례연차 ${prorated}일 (입사일~전년 말 ${days}일 ÷ 365 × 15, 올림) + 월차 ${monthly}일${carryNote}`,
@@ -324,7 +348,7 @@ export default function LeaveLedger() {
     const accruedFor = (w, y) => {
       const asOfY = y >= today.getFullYear() ? today : new Date(y, 11, 31);
       const prevUsed = usedHours(logsInYear(logs?.[w.id], y - 1));
-      return calcAccrued(w.hireDate, y, asOfY, prevUsed);
+      return calcAccrued(w.hireDate, y, asOfY, prevUsed, w.missedMonths);
     };
     return workers.map((w) => {
       const { accrued, basis } = accruedFor(w, year);
@@ -415,6 +439,23 @@ export default function LeaveLedger() {
     ? calcAbsence(logsInYear(logs?.[selected.id], year), selected.accrued, absMonth)
     : null;
   const selectedYearLogs = selected ? logsInYear(logs?.[selected.id], year) : [];
+  // 월차가 발생하는 입사 후 1~11개월차 목록 (입사 연도와 그 다음 해에 보여줌)
+  const monthlyPeriods = (() => {
+    if (!selected) return [];
+    const hire = new Date(selected.hireDate + "T00:00:00");
+    const hy = hire.getFullYear();
+    if (year < hy || year > hy + 1) return [];
+    const asOfY = year >= today.getFullYear() ? today : new Date(year, 11, 31);
+    const n = Math.min(11, tenure(hire, asOfY).totalMonths);
+    const arr = [];
+    for (let k = 1; k <= n; k++) {
+      const start = addMonths(hire, k - 1);
+      const end = addMonths(hire, k);
+      end.setDate(end.getDate() - 1);
+      arr.push({ k, start, end, missed: (selected.missedMonths || []).includes(k) });
+    }
+    return arr;
+  })();
   const selectedOther = selected
     ? ["paidSick", "unpaidSick", "official"]
         .map((k) => ({ k, h: sumByType(selectedYearLogs, k) }))
@@ -433,6 +474,16 @@ export default function LeaveLedger() {
   const updateWorker = (id, data) => {
     setWorkers((workers || []).map((w) => (w.id === id ? { ...w, ...data } : w)));
     setEditingWorker(false);
+  };
+
+  // 월차 만근 여부 토글: k개월차를 미만근 목록에 넣거나 뺌
+  const toggleMissedMonth = (workerId, k) => {
+    setWorkers((workers || []).map((w) => {
+      if (w.id !== workerId) return w;
+      const cur = w.missedMonths || [];
+      const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k].sort((a, b) => a - b);
+      return { ...w, missedMonths: next };
+    }));
   };
 
   const removeWorker = (id) => {
@@ -795,7 +846,7 @@ export default function LeaveLedger() {
       </section>
 
       <div style={styles.footNote}>
-        * 연차는 회계연도(1.1~12.31) 기준입니다. 입사 연도는 월차(월 1일, 최대 11일, 쓰지 않은 월차는 다음 해로 이월), 입사 다음 해 1.1에 근속 1년 미만이면 비례연차(올림)에 월차를 더해서, 그 외는 근속년수표를 따릅니다. 전년도 출근율은 앱에 기록된 연차 초과 결근만으로 계산한 추정치이니, 세부 사항은 실제 근태·급여 자료와 대조해 확인하세요.
+        * 연차는 회계연도(1.1~12.31) 기준입니다. 입사 연도는 월차(월 1일, 최대 11일, 쓰지 않은 월차는 다음 해로 이월), 입사 다음 해 1.1에 근속 1년 미만이면 비례연차(올림)에 월차를 더해서, 그 외는 근속년수표를 따릅니다. 월차는 상세 화면에서 만근하지 못한 달을 '미만근'으로 표시하면 그 달은 제외돼요. 전년도 출근율은 앱에 기록된 연차 초과 결근만으로 계산한 추정치이니, 세부 사항은 실제 근태·급여 자료와 대조해 확인하세요.
       </div>
 
       {/* Detail modal */}
@@ -850,6 +901,29 @@ export default function LeaveLedger() {
                   {selected.att.below && (
                     <div>법정 연차 대신 월 개근 시 1일씩만 발생하는 대상일 수 있어요. 부여 일수에는 자동 반영하지 않았어요.</div>
                   )}
+                </div>
+              )}
+
+              {monthlyPeriods.length > 0 && (
+                <div style={styles.monthBox}>
+                  <div style={{ fontWeight: 600, marginBottom: 2 }}>월차 만근 여부 (입사 후 1년 미만 기간)</div>
+                  <div style={{ fontSize: 11.5, color: "var(--ink-soft)", marginBottom: 6, lineHeight: 1.5 }}>
+                    만근하지 못한 달은 '미만근'으로 바꿔 주세요. 그 달의 월차 1일이 발생하지 않아요.
+                  </div>
+                  {monthlyPeriods.map((p) => (
+                    <div key={p.k} style={styles.monthRow}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <span style={{ fontWeight: 600 }}>{p.k}개월차</span>
+                        <span style={styles.monthRange}>{fmtDate(p.start)}~{fmtDate(p.end)}</span>
+                      </div>
+                      <button
+                        style={p.missed ? styles.monthMissed : styles.monthFull}
+                        onClick={() => toggleMissedMonth(selected.id, p.k)}
+                      >
+                        {p.missed ? "미만근" : "만근"}
+                      </button>
+                    </div>
+                  ))}
                 </div>
               )}
 
@@ -1281,6 +1355,23 @@ const styles = {
   absBox: {
     marginTop: 12, padding: "10px 12px", borderRadius: 8,
     background: "#F3E4E1", color: "#7A3529", fontSize: 12.5, lineHeight: 1.55,
+  },
+  monthBox: {
+    marginTop: 12, padding: "10px 12px", borderRadius: 8,
+    background: "#F4F7F5", border: "1px solid var(--line)", fontSize: 12.5, lineHeight: 1.55,
+  },
+  monthRow: {
+    display: "flex", alignItems: "center", gap: 8, padding: "6px 0",
+    borderTop: "1px solid var(--line)",
+  },
+  monthRange: { marginLeft: 8, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" },
+  monthFull: {
+    fontSize: 11.5, padding: "4px 10px", borderRadius: 12, cursor: "pointer",
+    border: "1px solid #BFD8CF", background: "#E6F1EC", color: "#2F6F62", fontFamily: "var(--font-body)", fontWeight: 600,
+  },
+  monthMissed: {
+    fontSize: 11.5, padding: "4px 10px", borderRadius: 12, cursor: "pointer",
+    border: "1px solid #E3C7C0", background: "#F3E4E1", color: "#7A3529", fontFamily: "var(--font-body)", fontWeight: 600,
   },
   typeTag: {
     marginLeft: 6, fontSize: 10.5, padding: "1px 6px", borderRadius: 10, fontWeight: 600,
